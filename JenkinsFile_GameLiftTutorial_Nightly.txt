@@ -1,0 +1,234 @@
+pipeline {
+    
+    triggers {
+        cron('H(0-10) 0 * * 1-5')
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        disableConcurrentBuilds()
+        timestamps()
+    }
+
+    parameters {
+        // Perforce parameters
+        string(name: 'BUILD_SCRIPTS_WS', defaultValue: 'jenkins-BuildScripts-Nightly', description: 'Specify the build scripts workspace')
+        string(name: 'PROJECT_WS', defaultValue: 'jenkins-GameLiftTutorial-Nightly', description: 'Specify the projects workspace')
+
+        // Build parameters
+        string(name: 'CONFIGURATION', defaultValue: 'Shipping', description: 'Specify the target build configuration')
+        string(name: 'MAPS', defaultValue: '/Game/Maps/Main+/Game/Maps/Entry', description: 'Specify the maps you want to build')
+        string(name: 'ZIP_DIR', defaultValue: '.\\Zips', description: 'Specify the directory to store zipped builds')
+
+        
+        // Upload parameters
+        booleanParam(name: 'UPLOAD_TO_S3', defaultValue: true, description: 'Specify if the build is uploaded to S3')
+        string(name: 'S3_BUCKET', defaultValue: 'game-lift-tutorial-builds', description: 'Specify the S3 bucket you want the build to be uploaded to')
+        string(name: 'ROOT_DIR', defaultValue: 'nightly-builds', description: 'Specify the directory root you want the build to be uploaded to')
+        
+        // GameLift parameters
+        string(name: 'FLEET_NAME', defaultValue: 'GameLiftTutorial-fleet-nighlty', description: 'Specify the GameLIft fleet name')
+        string(name: 'SDK_VERSION', defaultValue: '5.1.0', description: 'Specify the GameLIft Server SDK version used in the project')
+        string(name: 'BUILD_VERSION', defaultValue: '1.0.0', description: 'Specify the GameLIft build version used in the project')
+        string(name: 'AWS_REGION', defaultValue: 'eu-west-1', description: 'Specify the fleets AWS home region')
+        string(name: 'ALIAS_ID', defaultValue: 'alias-4624d714-8dbe-47a0-9399-fe19cc08d067', description: 'Specify the GameLifts Nightly Alias that will be switched to the new Fleet')
+        string(name: 'POLLING_JOB', defaultValue: 'GameLiftTutorial_GameLift_Polling', description: 'Specify the name of the GameLift polling job')
+
+        // Notification parameters
+        string(name: 'EMAIL_LIST', defaultValue: 'samuel@supernimbus.net,samuel.hegner@gmail.com', description: 'Specify emails of people who want to be notified of build results. Separate emails with a comma. Do not include whitespace')
+        
+        // Cleanup parameters
+        booleanParam(name: 'CLEAN_WORKSPACE', defaultValue: true, description: 'Specify if the the workspace should be wiped after builds')
+    }
+
+    agent { 
+        label 'windows-UE5.2'
+    }
+    
+    stages {
+        stage('Sync Build Scripts') {
+            steps {
+                
+                echo 'STAGE - Sync Build Scripts'
+                
+                dir('build-scripts'){
+                    
+                    p4sync(
+                        charset: 'none',
+                        credential: 'perforce-credentials-Samuel',
+                        format: "${params.BUILD_SCRIPTS_WS}",
+                        populate: autoClean(delete: true, modtime: false, parallel: [enable: false, minbytes: '1024', minfiles: '1', threads: '4'], pin: '', quiet: true, replace: true, tidy: false),
+                        source: streamSource('//BuildScripts/Main')
+                    )
+
+                    stash(name: 'build', includes: 'Build.py')
+                    stash(name: 'upload', includes: 'Upload.py')
+                    stash(name: 'fleet', includes: 'LaunchFleet.py')
+                }
+            }
+        }
+        
+        stage('Set Build Name') {
+            steps {
+                
+                echo 'STAGE - Set Build Name'
+                
+                script {
+                    def currentDate = new Date().format("dd-MM-yyyy")
+                    currentBuild.displayName = "Nightly_${currentDate}_${env.BUILD_TAG}"
+                    env.BUILD_NAME = currentBuild.displayName
+                }
+                
+                echo "Build will be called: ${env.BUILD_NAME}"
+            }
+        }
+
+        stage('Sync Project Files') {
+            steps {
+                
+                echo 'STAGE - Sync Project Files'
+                
+                dir('project') {
+                    p4sync(
+                        charset: 'none',
+                        credential: 'perforce-credentials-Samuel',
+                        format: "${params.PROJECT_WS}",
+                        populate: autoClean(delete: true, modtime: false, parallel: [enable: false, minbytes: '1024', minfiles: '1', threads: '4'], pin: '', quiet: true, replace: true, tidy: false),
+                        source: streamSource('//GameLiftTutorial/Main')
+                    )
+                }
+            }
+        }
+        
+        stage('Build Pre-Requisites') {
+            steps {
+                
+                echo 'STAGE - Build Pre-Requisites'
+                
+                dir('project') {
+                    unstash 'build'
+                    powershell "python -u Build.py --pre_reqs --configuration=${params.CONFIGURATION}"
+                }
+            }
+        }
+
+        stage('Build Project') {
+            steps {
+                
+                echo 'STAGE - Build Project'
+                
+                dir('project') {
+                    unstash 'build'
+                    powershell "python -u Build.py --maps=${params.MAPS} --client --client_target=Win64 --server --server_target=Win64 --configuration=${params.CONFIGURATION}"
+                }
+            }
+        }       
+
+        stage('Include GameLift Files in Server') {
+            steps {
+                
+                echo 'STAGE - Include GameLift Files in Server'
+                
+                dir('project\\GameLiftFiles') {
+                    stash(name: 'gl_install', includes: 'install.bat')
+                    stash(name: 'gl_redist', includes: 'VC_redist.x64.exe')
+                }
+
+                dir('project\\Packaged\\WindowsServer') {
+                    unstash 'gl_install'
+                    unstash 'gl_redist'
+                }
+            }
+        }
+
+        stage('Launch Fleet') {
+            steps {
+                
+                echo 'STAGE - Launch GameLift Fleet'
+                
+                dir('gamelift') {
+                    unstash 'fleet'
+                    powershell "python -u LaunchFleet.py --build_name='${env.BUILD_NAME}' --build_sdk_version='${params.SDK_VERSION}' --build_version='${params.BUILD_VERSION}' --build_path='..\\project\\Packaged\\WindowsServer' --fleet_name='${params.FLEET_NAME}'  --aws_region='${params.AWS_REGION}'"
+
+                    script {
+                        FLEET_ID = readFile('fleetId.txt').trim()
+                    }
+
+                    echo "Fleet Id: ${FLEET_ID}"
+                    echo "Alias Id: ${params.ALIAS_ID}"
+                    
+                    build wait: false, job: "${params.POLLING_JOB}", parameters: [string(name: 'FLEET_ID', value: "${FLEET_ID}"), string(name: 'ALIAS_ID', value: "${params.ALIAS_ID}")]
+                }
+            }
+        }
+                
+        stage('Upload Build to S3') {
+            when {
+                expression { return params.UPLOAD_TO_S3 }
+            }
+            steps {
+                
+                echo 'STAGE - Upload Build to S3'
+                
+                dir('project') {
+                    unstash 'upload'
+                    powershell "python -u Upload.py --local_folder='${params.ZIP_DIR}' --remote_folder='${params.ROOT_DIR}/${env.BUILD_NAME}' --bucket='${params.S3_BUCKET}' --generate_links"
+
+                    script {
+                        env.BUILD_URLS = readFile('urls.txt').trim()
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        success {
+            echo "Build completed: SUCCESS"
+
+            emailext (
+                attachLog: true,
+                body: """Successful - Jenkins Build - ${env.JOB_NAME}
+--------------------------------------------------------------------------------------
+${env.JOB_NAME} built successfully. 
+You can find links to download the builds below.
+Logs are attached
+
+Build Links:
+${env.BUILD_URLS}
+--------------------------------------------------------------------------------------
+""",
+                compressLog: true,
+                replyTo: 'samuel@supernimbus',
+                subject: "Successful - Jenkins Build- ${env.JOB_NAME}",
+                to: "${params.EMAIL_LIST}"
+            )
+        }
+        
+        failure {
+            echo "Build completed: FAILURE"
+
+            emailext (
+                attachLog: true,
+                body: """Failure - Jenkins Build- ${env.JOB_NAME}
+--------------------------------------------------------------------------------------
+${env.JOB_NAME} built with errors. 
+Logs are attached
+--------------------------------------------------------------------------------------
+""",
+                compressLog: true,
+                replyTo: 'samuel@supernimbus',
+                subject: "Failure - Jenkins Build - ${env.JOB_NAME}",
+                to: "${params.EMAIL_LIST}"
+            )
+        }
+        
+        cleanup {
+            script {
+                if (params.CLEAN_WORKSPACE) {
+                    cleanWs()
+                }
+            }
+        }
+    }
+}

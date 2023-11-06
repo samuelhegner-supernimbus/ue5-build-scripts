@@ -1,0 +1,95 @@
+pipeline {
+    
+    agent any
+    
+    parameters {
+        // Perforce parameters
+        string(name: 'BUILD_SCRIPTS_WS', defaultValue: 'jenkins-BuildScripts-Polling', description: 'Specify the build scripts workspace')
+
+        // GameLift parameters
+        string(name: 'FLEET_ID', description: 'Specify newly launched fleet to poll for activation')
+        string(name: 'ALIAS_ID', description: 'Specify alias to switch to the new fleet after activation')
+
+        // Notification parameters
+        string(name: 'EMAIL_LIST', defaultValue: 'samuel@supernimbus.net,samuel.hegner@gmail.com', description: 'Specify emails of people who want to be notified of build results. Separate emails with a comma. Do not include whitespace')
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '5'))
+        timestamps()
+    }
+
+    stages {
+        stage('Sync Build Scripts') {
+            steps {
+
+                echo 'STAGE - Sync Build Scripts'
+
+                p4sync(
+                    charset: 'none',
+                    credential: 'perforce-credentials-Samuel',
+                    format: "${params.BUILD_SCRIPTS_WS}",
+                    populate: autoClean(delete: true, modtime: false, parallel: [enable: false, minbytes: '1024', minfiles: '1', threads: '4'], pin: '', quiet: true, replace: true, tidy: false),
+                    source: streamSource('//BuildScripts/Main')
+                )
+            }
+        }
+
+        stage('Polling Fleet') {
+            steps {
+
+                echo 'STAGE - Polling Fleet'
+
+                echo "Polling Fleet: ${params.FLEET_ID}"
+                echo "Updating Alias: ${params.ALIAS_ID}"
+                sh "python3 -u UpdateGameLift.py --alias_id='${params.ALIAS_ID}' --fleet_id='${params.FLEET_ID}' --monitoring_interval 30"
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Build completed: SUCCESS"
+
+            emailext (
+                attachLog: true,
+                body: """Successful - Jenkins Build - ${env.JOB_NAME}
+--------------------------------------------------------------------------------------
+${env.JOB_NAME} built successfully. 
+
+Fleet ${params.FLEET_ID} activated sucessfully
+Alias ${params.ALIAS_ID} succesfully switched to point at new fleet
+--------------------------------------------------------------------------------------
+""",
+                compressLog: true,
+                replyTo: 'samuel@supernimbus',
+                subject: "Successful - Jenkins Build- ${env.JOB_NAME}",
+                to: "${params.EMAIL_LIST}"
+            )
+        }
+        
+        failure {
+            echo "Build completed: FAILURE"
+
+            emailext (
+                attachLog: true,
+                body: """Failure - Jenkins Build- ${env.JOB_NAME}
+--------------------------------------------------------------------------------------
+${env.JOB_NAME} built with errors
+Logs are attached
+--------------------------------------------------------------------------------------
+""",
+                compressLog: true,
+                replyTo: 'samuel@supernimbus',
+                subject: "Failure - Jenkins Build - ${env.JOB_NAME}",
+                to: "${params.EMAIL_LIST}"
+            )
+        }
+        
+        cleanup {
+            script {
+                cleanWs()
+            }
+        }
+    }
+}
